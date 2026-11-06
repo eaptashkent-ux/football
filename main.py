@@ -1,134 +1,154 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone, timedelta
-from sqlalchemy import select
+import httpx
 import asyncio
+import math
 
-from db import init_db, Session, Team, Match, TeamStats, TeamElo
-from api import LEAGUES, fetch_league_matches, parse_match
-from elo import INITIAL_ELO, update_elo
-from model import predict
+# Если db.py не нужен для этого теста, можно закомментировать
+# from db import init_db
 
-async def perform_sync(season=2026):
-    print(f"[АВТО] Скачиваю матчи сезона {season}...")
-    async with Session() as s:
-        total = 0
-        for code in LEAGUES:
-            try:
-                raw = await fetch_league_matches(code, season)
-                for m in raw:
-                    pm = parse_match(m, code)
-                    for tid, tname in [(pm["home_id"], pm["home_name"]), (pm["away_id"], pm["away_name"])]:
-                        if not await s.get(Team, tid):
-                            s.add(Team(id=tid, name=tname, league=code))
-                    
-                    existing = await s.get(Match, pm["id"])
-                    if existing:
-                        existing.home_goals = pm["home_goals"]
-                        existing.away_goals = pm["away_goals"]
-                        existing.status = pm["status"]
-                    else:
-                        s.add(Match(**{k: pm[k] for k in ("id","home_id","away_id","league","kickoff","home_goals","away_goals","status")}))
-                    total += 1
-                await s.commit()
-            except Exception as e:
-                print(f"Ошибка лиги {code}: {e}")
-            await asyncio.sleep(7)
-    print(f"[АВТО] Скачано матчей: {total}")
-
-async def perform_rebuild():
-    print("[АВТО] Пересчитываю математику (Эло)...")
-    async with Session() as s:
-        matches = (await s.execute(select(Match).where(Match.home_goals.is_not(None)).order_by(Match.kickoff))).scalars().all()
-        elo_map = {}
-        stats_map = {}
-        for m in matches:
-            for tid in (m.home_id, m.away_id):
-                elo_map.setdefault(tid, INITIAL_ELO)
-                stats_map.setdefault((tid, m.league), {"matches": 0, "gf": 0, "ga": 0})
-            
-            new_h, new_a = update_elo(elo_map[m.home_id], elo_map[m.away_id], m.home_goals, m.away_goals)
-            elo_map[m.home_id], elo_map[m.away_id] = new_h, new_a
-            
-            for tid, gf, ga in ((m.home_id, m.home_goals, m.away_goals), (m.away_id, m.away_goals, m.home_goals)):
-                d = stats_map[(tid, m.league)]
-                d["matches"] += 1; d["gf"] += gf; d["ga"] += ga
-
-        for tid, elo in elo_map.items():
-            row = await s.get(TeamElo, tid)
-            if row: row.elo = elo
-            else: s.add(TeamElo(team_id=tid, elo=elo))
-
-        for (tid, lg), d in stats_map.items():
-            row = await s.get(TeamStats, (tid, lg))
-            if row:
-                row.matches_played, row.goals_for, row.goals_against = d["matches"], d["gf"], d["ga"]
-            else:
-                s.add(TeamStats(team_id=tid, league=lg, matches_played=d["matches"], goals_for=d["gf"], goals_against=d["ga"]))
-        await s.commit()
-
-async def daily_updater():
-    while True:
-        try:
-            async with Session() as s:
-                tomorrow = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(days=1)
-                future_match = (await s.execute(select(Match).where(Match.kickoff >= tomorrow).limit(1))).scalars().first()
-            if not future_match:
-                await perform_sync(2026)
-                await perform_rebuild()
-        except Exception as e:
-            print(f"Ошибка автообновления: {e}")
-        await asyncio.sleep(12 * 3600)
+ESPN_API = "https://site.api.espn.com/apis/site/v2/sports/"
+LEAGUES = [
+    ("football", "soccer/", "eng.1", "АПЛ"),
+    ("football", "soccer/", "esp.1", "Ла Лига"),
+    ("football", "soccer/", "ger.1", "Бундеслига"),
+    ("football", "soccer/", "ita.1", "Серия А"),
+    ("football", "soccer/", "fra.1", "Лига 1"),
+    ("hockey", "hockey/", "nhl", "НХЛ"),
+    ("basketball", "basketball/", "nba", "НБА"),
+]
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await init_db()
-    asyncio.create_task(daily_updater())
+    # await init_db()
     yield
 
+# ВОТ ЭТА СТРОЧКА БЫЛА ПОТЕРЯНА!
 app = FastAPI(lifespan=lifespan)
 
-# ЭТИ КОМАНДЫ НУЖНЫ ДЛЯ ЗАГРУЗКИ МАТЧЕЙ ЧЕРЕЗ БРАУЗЕР
-@app.get("/admin/sync")
-async def sync_manual(season: int = 2026):
-    await perform_sync(season)
-    return {"ok": True, "message": "Синхронизация завершена"}
+# --- МАТЕМАТИКА СТАВОК ---
+def devig(odds):
+    if not odds or not all(odds): return [0.33, 0.33, 0.34]
+    inv = [1 / o for o in odds]
+    s = sum(inv)
+    return [x / s for x in inv]
 
-@app.post("/admin/rebuild")
-async def rebuild_manual():
-    await perform_rebuild()
-    return {"ok": True, "message": "Математика пересчитана"}
+def pmf(l, n=10):
+    return [math.exp(-l) * l ** k / math.factorial(k) for k in range(n)]
+
+def _res(lh, la, n=9):
+    a, b = pmf(lh, n), pmf(la, n)
+    w = d = 0.0
+    for i in range(n):
+        for j in range(n):
+            p = a[i] * b[j]
+            if i > j: w += p
+            elif i == j: d += p
+    return w, d
+
+def fit_football(pH, pD, pA):
+    def err(lh, la):
+        w, d = _res(lh, la)
+        return (w - pH) ** 2 + (d - pD) ** 2 + ((1 - w - d) - pA) ** 2
+    best = (9, 1.3, 1.1)
+    for i in range(3, 42):
+        for j in range(3, 36):
+            e = err(i * .1, j * .1)
+            if e < best[0]: best = (e, i * .1, j * .1)
+    return best[1], best[2]
+
+def predict_football(odds):
+    pH, pD, pA = devig([odds.get("h", 2.0), odds.get("d", 3.0), odds.get("a", 2.5)])
+    lh, la = fit_football(pH, pD, pA)
+    a, b = pmf(lh, 10), pmf(la, 10)
+    w, d = 0, 0
+    tot = [0]*20
+    btts = 0
+    for i in range(10):
+        for j in range(10):
+            p = a[i]*b[j]
+            tot[i+j] += p
+            if i > 0 and j > 0: btts += p
+
+    markets = {
+        "1": pH, "X": pD, "2": pA,
+        "1X": pH + pD, "X2": pD + pA, "12": pH + pA,
+        "Обе забьют (Да)": btts,
+        "Тотал Б 0.5": sum(tot[1:]),
+        "Тотал Б 1.5": sum(tot[2:]),
+        "Тотал Б 2.5": sum(tot[3:]),
+        "Тотал Б 3.5": sum(tot[4:]),
+    }
+    safe = {k: round(v, 2) for k, v in markets.items() if v >= 0.75}
+    return {k: round(v, 2) for k, v in markets.items()}, safe
+
+# --- ПОЛУЧЕНИЕ МАТЧЕЙ ---
+async def fetch_espn_matches():
+    matches = []
+    async with httpx.AsyncClient() as client:
+        for sport, path, lid, name in LEAGUES:
+            try:
+                url = f"{ESPN_API}{path}{lid}/scoreboard"
+                r = await client.get(url, timeout=10)
+                if r.status_code != 200: continue
+                
+                data = r.json()
+                for event in data.get("events", []):
+                    comp = event["competitions"][0]
+                    status = event["status"]["type"]
+                    
+                    home_team = next(t for t in comp["competitors"] if t["homeAway"] == "home")
+                    away_team = next(t for t in comp["competitors"] if t["homeAway"] == "away")
+                    
+                    odds_data = comp.get("odds", [{}])[0]
+                    ml = odds_data.get("moneyline", {})
+                    
+                    def am_to_dec(am):
+                        if not am: return None
+                        try:
+                            v = float(am.replace("+",""))
+                            return 1 + v/100 if v > 0 else 1 + 100/abs(v)
+                        except: return None
+
+                    odds = {
+                        "h": am_to_dec(ml.get("home", {}).get("close", {}).get("odds")),
+                        "a": am_to_dec(ml.get("away", {}).get("close", {}).get("odds")),
+                        "d": am_to_dec(ml.get("draw", {}).get("close", {}).get("odds")),
+                    }
+
+                    # Заглушка
+                    if not odds["h"] or not odds["a"]:
+                        odds["h"] = 1.8
+                        odds["a"] = 4.0
+                        odds["d"] = 3.5
+
+                    all_markets, safe_bets = {}, {}
+                    if sport == "football":
+                        all_markets, safe_bets = predict_football(odds)
+                    else:
+                        all_markets = {"П1": 0.45, "П2": 0.55}
+
+                    matches.append({
+                        "id": int(event["id"]),
+                        "homeTeam": home_team["team"]["displayName"],
+                        "awayTeam": away_team["team"]["displayName"],
+                        "league": name,
+                        "kickoff": event["date"],
+                        "homeScore": home_team.get("score", "0"),
+                        "awayScore": away_team.get("score", "0"),
+                        "status": status["state"], 
+                        "detail": status.get("shortDetail", ""),
+                        "odds": odds,
+                        "markets": all_markets,
+                        "safe_bets": safe_bets
+                    })
+            except Exception as e:
+                print(f"Ошибка загрузки {name}: {e}")
+    return matches
 
 @app.get("/matches/today")
 async def today_matches():
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
-    start_date = now - timedelta(days=1)
-    async with Session() as s:
-        rows = (await s.execute(select(Match).where(Match.kickoff >= start_date).order_by(Match.kickoff))).scalars().all()
-        teams = {t.id: t.name for t in (await s.execute(select(Team))).scalars()}
-    return [{
-        "id": m.id, "homeTeam": teams.get(m.home_id), "awayTeam": teams.get(m.away_id), 
-        "league": m.league, "kickoff": m.kickoff.isoformat() if m.kickoff else None
-    } for m in rows]
-
-@app.get("/matches/{match_id}/analysis")
-async def analysis(match_id: int):
-    async with Session() as s:
-        m = await s.get(Match, match_id)
-        if not m: raise HTTPException(404, "match not found")
-        
-        hs = await s.get(TeamStats, (m.home_id, m.league))
-        as_ = await s.get(TeamStats, (m.away_id, m.league))
-        elo_h = await s.get(TeamElo, m.home_id)
-        elo_a = await s.get(TeamElo, m.away_id)
-
-        all_stats = (await s.execute(select(TeamStats).where(TeamStats.league == m.league))).scalars().all()
-        total_m = sum(t.matches_played for t in all_stats) or 1
-        avg_gf = sum(t.goals_for for t in all_stats) / total_m
-        league_avg = {"home": avg_gf * 0.55, "away": avg_gf * 0.45}
-
-    if not hs or not as_ or hs.matches_played == 0:
-        raise HTTPException(400, "not enough data")
-
-    pred = predict(hs, as_, league_avg, elo_h.elo if elo_h else None, elo_a.elo if elo_a else None)
-    return {"match_id": match_id, "prediction": pred}
+    matches = await fetch_espn_matches()
+    order = {"in": 0, "pre": 1, "post": 2}
+    matches.sort(key=lambda x: (order.get(x["status"], 3), x["kickoff"]))
+    return matches

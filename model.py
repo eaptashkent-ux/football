@@ -1,10 +1,20 @@
-from math import exp, factorial
+import math
 
-MAX_GOALS = 7
+MAX_GOALS = 8
 WEIGHT_ELO = 0.35
 
-def poisson_pmf(k, lam):
-    return exp(-lam) * (lam ** k) / factorial(k)
+def pois(k, lam):
+    return math.exp(-lam) * lam ** k / math.factorial(k)
+
+def _matrix(lh, la, maxg=8, rho=-0.06):
+    m = [[pois(i, lh) * pois(j, la) for j in range(maxg + 1)] for i in range(maxg + 1)]
+    if rho:
+        m[0][0] *= max(0.0, 1 - lh * la * rho)
+        m[0][1] *= 1 + lh * rho
+        m[1][0] *= 1 + la * rho
+        m[1][1] *= 1 - rho
+    s = sum(map(sum, m))
+    return [[x / s for x in r] for r in m]
 
 def predict(hs, as_, league_avg, elo_home=None, elo_away=None):
     home_att = (hs.goals_for / max(1, hs.matches_played)) / max(0.1, league_avg["home"])
@@ -15,19 +25,13 @@ def predict(hs, as_, league_avg, elo_home=None, elo_away=None):
     lam_h = home_att * away_def * league_avg["home"]
     lam_a = away_att * home_def * league_avg["away"]
 
-    # Матрица вероятностей точных счетов
-    matrix = {}
-    for h in range(MAX_GOALS + 1):
-        for a in range(MAX_GOALS + 1):
-            matrix[(h, a)] = poisson_pmf(h, lam_h) * poisson_pmf(a, lam_a)
-
-    # Считаем базовые исходы (1X2)
-    p_home = sum(p for (h, a), p in matrix.items() if h > a)
-    p_draw = sum(p for (h, a), p in matrix.items() if h == a)
-    p_away = sum(p for (h, a), p in matrix.items() if h < a)
-    total_1x2 = p_home + p_draw + p_away
+    M = _matrix(lam_h, lam_a)
+    n = MAX_GOALS + 1
     
-    # Смешиваем с Эло (если есть)
+    p_home = sum(M[i][j] for i in range(n) for j in range(n) if i > j)
+    p_draw = sum(M[i][i] for i in range(n))
+    p_away = 1 - p_home - p_draw
+
     if elo_home is not None and elo_away is not None:
         from elo import elo_to_probabilities
         e_h, e_d, e_a = elo_to_probabilities(elo_home, elo_away)
@@ -38,45 +42,28 @@ def predict(hs, as_, league_avg, elo_home=None, elo_away=None):
         total_1x2 = p_home + p_draw + p_away
         p_home, p_draw, p_away = p_home/total_1x2, p_draw/total_1x2, p_away/total_1x2
 
-    # Считаем остальные рынки на основе матрицы счета
-    p_btts_yes = sum(p for (h, a), p in matrix.items() if h > 0 and a > 0)
+    btts = sum(M[i][j] for i in range(1, n) for j in range(1, n))
     
-    p_total_over_05 = sum(p for (h, a), p in matrix.items() if h + a > 0.5)
-    p_total_over_15 = sum(p for (h, a), p in matrix.items() if h + a > 1.5)
-    p_total_over_25 = sum(p for (h, a), p in matrix.items() if h + a > 2.5)
-    p_total_over_35 = sum(p for (h, a), p in matrix.items() if h + a > 3.5)
-
-    p_it1_over_05 = sum(p for (h, a), p in matrix.items() if h > 0.5)
-    p_it1_over_15 = sum(p for (h, a), p in matrix.items() if h > 1.5)
-    p_it2_over_05 = sum(p for (h, a), p in matrix.items() if a > 0.5)
-    p_it2_over_15 = sum(p for (h, a), p in matrix.items() if a > 1.5)
-
     p_1x = p_home + p_draw
     p_x2 = p_away + p_draw
     p_12 = p_home + p_away
 
-    # Форы (Европейский гандикап)
-    p_home_plus_15 = sum(p for (h, a), p in matrix.items() if h + 1.5 > a)
-    p_away_plus_15 = sum(p for (h, a), p in matrix.items() if a + 1.5 > h)
-
-    # Собираем все исходы в словарь для удобства
     all_markets = {
         "П1": p_home, "Х": p_draw, "П2": p_away,
         "1Х": p_1x, "Х2": p_x2, "12": p_12,
-        "Обе забьют (Да)": p_btts_yes,
-        "Тотал Б 0.5": p_total_over_05,
-        "Тотал Б 1.5": p_total_over_15,
-        "Тотал Б 2.5": p_total_over_25,
-        "Тотал Б 3.5": p_total_over_35,
-        "ИТ1 Б 0.5": p_it1_over_05,
-        "ИТ1 Б 1.5": p_it1_over_15,
-        "ИТ2 Б 0.5": p_it2_over_05,
-        "ИТ2 Б 1.5": p_it2_over_15,
-        "Фора 1 (+1.5)": p_home_plus_15,
-        "Фора 2 (+1.5)": p_away_plus_15
+        "Обе забьют (Да)": btts,
+        "Обе забьют (Нет)": 1 - btts,
     }
 
-    # Фильтруем ставки с проходимостью >= 75% (самые безопасные)
+    for L in [0.5, 1.5, 2.5, 3.5]:
+        over = sum(M[i][j] for i in range(n) for j in range(n) if i + j > L)
+        all_markets[f"Тотал Б {L}"] = over
+        all_markets[f"Тотал М {L}"] = 1 - over
+
+    # Топ-3 вероятных счета
+    flat = sorted(((M[i][j], f"{i}:{j}") for i in range(n) for j in range(n)), reverse=True)[:3]
+    top_scores = ", ".join(f"{s} ({p:.0%})" for p, s in flat)
+
     safe_bets = {k: round(v, 3) for k, v in all_markets.items() if v >= 0.75}
 
     return {
@@ -84,6 +71,7 @@ def predict(hs, as_, league_avg, elo_home=None, elo_away=None):
         "draw": round(p_draw, 3),
         "away": round(p_away, 3),
         "expected_score": f"{lam_h:.1f} : {lam_a:.1f}",
+        "top_scores": top_scores,
         "all_markets": {k: round(v, 3) for k, v in all_markets.items()},
-        "safe_bets": safe_bets  # <--- Самые надежные ставки
+        "safe_bets": safe_bets
     }
