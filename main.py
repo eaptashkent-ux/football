@@ -9,39 +9,36 @@ from api import LEAGUES, fetch_league_matches, parse_match
 from elo import INITIAL_ELO, update_elo
 from model import predict
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    await init_db()
-    yield
-
-app = FastAPI(lifespan=lifespan)
-
-@app.get("/admin/sync")
-async def sync_season(season: int = 2026):
+# --- ФУНКЦИИ СИНХРОНИЗАЦИИ ---
+async def perform_sync(season=2026):
+    print(f"[АВТО] Скачиваю матчи сезона {season}...")
     async with Session() as s:
         total = 0
         for code in LEAGUES:
-            raw = await fetch_league_matches(code, season)
-            for m in raw:
-                pm = parse_match(m, code)
-                for tid, tname in [(pm["home_id"], pm["home_name"]), (pm["away_id"], pm["away_name"])]:
-                    if not await s.get(Team, tid):
-                        s.add(Team(id=tid, name=tname, league=code))
-                
-                existing = await s.get(Match, pm["id"])
-                if existing:
-                    existing.home_goals = pm["home_goals"]
-                    existing.away_goals = pm["away_goals"]
-                    existing.status = pm["status"]
-                else:
-                    s.add(Match(**{k: pm[k] for k in ("id","home_id","away_id","league","kickoff","home_goals","away_goals","status")}))
-                total += 1
-            await s.commit()
+            try:
+                raw = await fetch_league_matches(code, season)
+                for m in raw:
+                    pm = parse_match(m, code)
+                    for tid, tname in [(pm["home_id"], pm["home_name"]), (pm["away_id"], pm["away_name"])]:
+                        if not await s.get(Team, tid):
+                            s.add(Team(id=tid, name=tname, league=code))
+                    
+                    existing = await s.get(Match, pm["id"])
+                    if existing:
+                        existing.home_goals = pm["home_goals"]
+                        existing.away_goals = pm["away_goals"]
+                        existing.status = pm["status"]
+                    else:
+                        s.add(Match(**{k: pm[k] for k in ("id","home_id","away_id","league","kickoff","home_goals","away_goals","status")}))
+                    total += 1
+                await s.commit()
+            except Exception as e:
+                print(f"Ошибка лиги {code}: {e}")
             await asyncio.sleep(7)
-    return {"ok": True, "matches_loaded": total}
+    print(f"[АВТО] Скачано матчей: {total}")
 
-@app.post("/admin/rebuild")
-async def rebuild():
+async def perform_rebuild():
+    print("[АВТО] Пересчитываю математику (Эло)...")
     async with Session() as s:
         matches = (await s.execute(select(Match).where(Match.home_goals.is_not(None)).order_by(Match.kickoff))).scalars().all()
         elo_map = {}
@@ -70,21 +67,49 @@ async def rebuild():
             else:
                 s.add(TeamStats(team_id=tid, league=lg, matches_played=d["matches"], goals_for=d["gf"], goals_against=d["ga"]))
         await s.commit()
-    return {"ok": True, "matches_processed": len(matches)}
+
+# --- ФОНОВЫЙ ПРОЦЕСС (РАБОТАЕТ САМ) ---
+async def daily_updater():
+    while True:
+        try:
+            # Проверяем, есть ли в базе матчи на будущее
+            async with Session() as s:
+                tomorrow = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(days=1)
+                future_match = (await s.execute(select(Match).where(Match.kickoff >= tomorrow).limit(1))).scalars().first()
+            
+            # Если будущих матчей нет, значит база устарела (или пустая) - обновляем!
+            if not future_match:
+                await perform_sync(2026)
+                await perform_rebuild()
+        except Exception as e:
+            print(f"Ошибка автообновления: {e}")
+        
+        # Ждем 12 часов и проверяем снова
+        await asyncio.sleep(12 * 3600)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_db()
+    # Запускаем фоновый автообновлятор
+    asyncio.create_task(daily_updater())
+    yield
+
+app = FastAPI(lifespan=lifespan)
 
 @app.get("/matches/today")
 async def today_matches():
-    # ТЕПЕРЬ МЫ БЕРЕМ ВСЕ МАТЧИ ИЗ БАЗЫ, БЕЗ ФИЛЬТРА ПО ДАТЕ
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    start_date = now - timedelta(days=1)
+    
     async with Session() as s:
-        rows = (await s.execute(select(Match).order_by(Match.kickoff))).scalars().all()
+        rows = (await s.execute(
+            select(Match).where(Match.kickoff >= start_date).order_by(Match.kickoff)
+        )).scalars().all()
         teams = {t.id: t.name for t in (await s.execute(select(Team))).scalars()}
         
     return [{
-        "id": m.id, 
-        "homeTeam": teams.get(m.home_id), 
-        "awayTeam": teams.get(m.away_id), 
-        "league": m.league, 
-        "kickoff": m.kickoff.isoformat() if m.kickoff else None
+        "id": m.id, "homeTeam": teams.get(m.home_id), "awayTeam": teams.get(m.away_id), 
+        "league": m.league, "kickoff": m.kickoff.isoformat() if m.kickoff else None
     } for m in rows]
 
 @app.get("/matches/{match_id}/analysis")
