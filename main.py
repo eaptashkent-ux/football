@@ -1,135 +1,134 @@
-"""Прогноз матча: хоккей, волейбол, баскетбол, футбол.
+from fastapi import FastAPI, HTTPException
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone, timedelta
+from sqlalchemy import select
+import asyncio
 
-Примеры:
-  python main.py --sport football --home "Manchester City" --away "Brighton"
-  python main.py --sport football --home "Manchester City" --away "Brighton" \
-      --absent-home "De Bruyne:M" --absent-away "Welbeck:F?" --odds "1=1.45,X=5,2=7,btts_y=1.8,over_2.5=1.6"
-  python main.py --demo --sport hockey --home "SKA" --away "CSKA"
+from db import init_db, Session, Team, Match, TeamStats, TeamElo
+from api import LEAGUES, fetch_league_matches, parse_match
+from elo import INITIAL_ELO, update_elo
+from model import predict
 
-Ключи (переменные окружения):  API_SPORTS_KEY, ODDS_API_KEY
-"""
-import argparse
-import csv
-import datetime as dt
-import os
-import sys
+async def perform_sync(season=2026):
+    print(f"[АВТО] Скачиваю матчи сезона {season}...")
+    async with Session() as s:
+        total = 0
+        for code in LEAGUES:
+            try:
+                raw = await fetch_league_matches(code, season)
+                for m in raw:
+                    pm = parse_match(m, code)
+                    for tid, tname in [(pm["home_id"], pm["home_name"]), (pm["away_id"], pm["away_name"])]:
+                        if not await s.get(Team, tid):
+                            s.add(Team(id=tid, name=tname, league=code))
+                    
+                    existing = await s.get(Match, pm["id"])
+                    if existing:
+                        existing.home_goals = pm["home_goals"]
+                        existing.away_goals = pm["away_goals"]
+                        existing.status = pm["status"]
+                    else:
+                        s.add(Match(**{k: pm[k] for k in ("id","home_id","away_id","league","kickoff","home_goals","away_goals","status")}))
+                    total += 1
+                await s.commit()
+            except Exception as e:
+                print(f"Ошибка лиги {code}: {e}")
+            await asyncio.sleep(7)
+    print(f"[АВТО] Скачано матчей: {total}")
 
-from models import ROLE_HELP, confidence, predict
-from providers import ApiSports, Demo, ProviderError, fetch_odds
+async def perform_rebuild():
+    print("[АВТО] Пересчитываю математику (Эло)...")
+    async with Session() as s:
+        matches = (await s.execute(select(Match).where(Match.home_goals.is_not(None)).order_by(Match.kickoff))).scalars().all()
+        elo_map = {}
+        stats_map = {}
+        for m in matches:
+            for tid in (m.home_id, m.away_id):
+                elo_map.setdefault(tid, INITIAL_ELO)
+                stats_map.setdefault((tid, m.league), {"matches": 0, "gf": 0, "ga": 0})
+            
+            new_h, new_a = update_elo(elo_map[m.home_id], elo_map[m.away_id], m.home_goals, m.away_goals)
+            elo_map[m.home_id], elo_map[m.away_id] = new_h, new_a
+            
+            for tid, gf, ga in ((m.home_id, m.home_goals, m.away_goals), (m.away_id, m.away_goals, m.home_goals)):
+                d = stats_map[(tid, m.league)]
+                d["matches"] += 1; d["gf"] += gf; d["ga"] += ga
 
-sys.stdout.reconfigure(encoding="utf-8")
+        for tid, elo in elo_map.items():
+            row = await s.get(TeamElo, tid)
+            if row: row.elo = elo
+            else: s.add(TeamElo(team_id=tid, elo=elo))
 
+        for (tid, lg), d in stats_map.items():
+            row = await s.get(TeamStats, (tid, lg))
+            if row:
+                row.matches_played, row.goals_for, row.goals_against = d["matches"], d["gf"], d["ga"]
+            else:
+                s.add(TeamStats(team_id=tid, league=lg, matches_played=d["matches"], goals_for=d["gf"], goals_against=d["ga"]))
+        await s.commit()
 
-def parse_absent(items):
-    out = []
-    for s in items or []:
-        name, _, role = s.partition(":")
-        doubt = role.endswith("?")
-        out.append(dict(name=name.strip(), role=(role.rstrip("?").strip().upper() or "U"), doubt=doubt))
-    return out
-
-
-def parse_odds(s):
-    out = {}
-    for part in (s or "").split(","):
-        if "=" in part:
-            k, v = part.split("=", 1)
-            out[k.strip()] = float(v)
-    return out
-
-
-def form_line(ms):
-    return " ".join("W" if m["gf"] > m["ga"] else "D" if m["gf"] == m["ga"] else "L" for m in ms[:6])
-
-
-def market_probs(odds, primary):
-    """Вероятности рынка основного исхода без маржи букмекера."""
-    if not all(i in odds for i in primary):
-        return {}
-    inv = {i: 1 / odds[i] for i in primary}
-    s = sum(inv.values())
-    return {i: v / s for i, v in inv.items()}
-
-
-def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--sport", required=True, choices=["football", "hockey", "basketball", "volleyball"])
-    ap.add_argument("--home", required=True)
-    ap.add_argument("--away", required=True)
-    ap.add_argument("--n", type=int, default=10, help="сколько последних матчей брать (по умолч. 10)")
-    ap.add_argument("--absent-home", action="append", metavar="ИМЯ:РОЛЬ", help="'?' в конце = под вопросом")
-    ap.add_argument("--absent-away", action="append", metavar="ИМЯ:РОЛЬ")
-    ap.add_argument("--odds", help="свои коэффициенты: 1=1.45,X=5,2=7,btts_y=1.8,over_2.5=1.6,ml_h=1.5")
-    ap.add_argument("--league-key", help="ключ лиги The Odds API (soccer_epl, icehockey_nhl, basketball_nba) для автозагрузки кэфов")
-    ap.add_argument("--line", type=float, action="append", default=[], help="доп. линия тотала")
-    ap.add_argument("--demo", action="store_true", help="синтетические данные для проверки")
-    ap.add_argument("--min-prob", type=float, default=0.65, help="порог для списка «сильных» исходов")
-    a = ap.parse_args()
-
-    key = os.environ.get("API_SPORTS_KEY")
-    if a.demo or not key:
-        if not a.demo:
-            print("! Нет API_SPORTS_KEY - работаю на ДЕМО-данных (это не реальная форма команд).\n")
-        src = Demo()
-    else:
-        src = ApiSports(key)
-
-    try:
-        hm, am = src.form(a.sport, a.home, a.n), src.form(a.sport, a.away, a.n)
-        if not hm or not am:
-            sys.exit("Нет завершённых матчей для одной из команд - прогноз невозможен.")
-        ah, aa, note = src.absences(a.sport, a.home, a.away)
-    except (ProviderError, Exception) as e:  # сеть, лимит, неверный ключ
-        sys.exit(f"Ошибка загрузки данных: {e}")
-    ah += parse_absent(a.absent_home)
-    aa += parse_absent(a.absent_away)
-
-    odds = parse_odds(a.odds)
-    if a.league_key and os.environ.get("ODDS_API_KEY"):
+async def daily_updater():
+    while True:
         try:
-            odds = {**fetch_odds(os.environ["ODDS_API_KEY"], a.league_key, a.sport, a.home, a.away), **odds}
+            async with Session() as s:
+                tomorrow = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(days=1)
+                future_match = (await s.execute(select(Match).where(Match.kickoff >= tomorrow).limit(1))).scalars().first()
+            if not future_match:
+                await perform_sync(2026)
+                await perform_rebuild()
         except Exception as e:
-            print(f"! Коэффициенты не загружены: {e}")
+            print(f"Ошибка автообновления: {e}")
+        await asyncio.sleep(12 * 3600)
 
-    pred = predict(a.sport, hm, am, ah, aa, a.line)
-    mk = pred["markets"]
-    mprobs = market_probs(odds, pred["primary"])
-    conf = confidence(pred, mprobs)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_db()
+    asyncio.create_task(daily_updater())
+    yield
 
-    print(f"=== {a.home} - {a.away}  [{a.sport}]  источник: {src.name}")
-    print(f"Форма {a.home}: {form_line(hm)}  (в среднем {sum(m['gf'] for m in hm)/len(hm):.2f}:{sum(m['ga'] for m in hm)/len(hm):.2f})")
-    print(f"Форма {a.away}: {form_line(am)}  (в среднем {sum(m['gf'] for m in am)/len(am):.2f}:{sum(m['ga'] for m in am)/len(am):.2f})")
-    for side, lst in ((a.home, ah), (a.away, aa)):
-        if lst:
-            print(f"Отсутствуют у {side}: " + ", ".join(f"{p['name']} ({p['role']}{'?' if p.get('doubt') else ''})" for p in lst))
-    print(note)
-    print("Роли:", ROLE_HELP[a.sport])
-    print()
-    for line in pred["info"]:
-        print(line)
-    print("\nВсе рынки (вероятность по модели):")
-    for i, (label, p) in sorted(mk.items(), key=lambda kv: -kv[1][1]):
-        mark = ""
-        if i in odds:
-            edge = p * odds[i] - 1
-            kelly = max(0.0, edge / (odds[i] - 1)) * 0.25
-            mark = f"  кэф {odds[i]:.2f}  edge {edge:+.1%}" + (f"  ставка ≤ {min(kelly, 0.05):.1%} банка (¼ Келли)" if edge > 0.03 else "")
-        print(f"  {p:6.1%}  {label}{mark}")
+app = FastAPI(lifespan=lifespan)
 
-    strong = [(p, l) for l, p in mk.values() if p >= a.min_prob]
-    print(f"\nИсходы с вероятностью ≥ {a.min_prob:.0%}: " + (", ".join(f"{l} ({p:.0%})" for p, l in sorted(strong, reverse=True)) or "нет"))
-    level = "высокая" if conf >= 65 else "средняя" if conf >= 45 else "низкая"
-    print(f"Надёжность прогноза: {conf}/90 ({level}) - зависит от объёма данных, чёткости перевеса и согласия с рынком.")
-    if not odds:
-        print("Коэффициенты не заданы: value-анализ (edge) не посчитан. Добавь --odds или --league-key.")
-    print("\nЭто вероятности модели, а не гарантия: даже исход на 80% проигрывает в каждом пятом матче,"
-          "\nа букмекеры закладывают маржу ~5%. Ставь только на положительный edge и не рискуй нужными деньгами.")
+# ЭТИ КОМАНДЫ НУЖНЫ ДЛЯ ЗАГРУЗКИ МАТЧЕЙ ЧЕРЕЗ БРАУЗЕР
+@app.get("/admin/sync")
+async def sync_manual(season: int = 2026):
+    await perform_sync(season)
+    return {"ok": True, "message": "Синхронизация завершена"}
 
-    with open(os.path.join(os.path.dirname(__file__), "predictions.csv"), "a", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        for i, (label, p) in mk.items():
-            w.writerow([dt.date.today(), a.sport, a.home, a.away, i, f"{p:.4f}", odds.get(i, "")])
+@app.post("/admin/rebuild")
+async def rebuild_manual():
+    await perform_rebuild()
+    return {"ok": True, "message": "Математика пересчитана"}
 
+@app.get("/matches/today")
+async def today_matches():
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    start_date = now - timedelta(days=1)
+    async with Session() as s:
+        rows = (await s.execute(select(Match).where(Match.kickoff >= start_date).order_by(Match.kickoff))).scalars().all()
+        teams = {t.id: t.name for t in (await s.execute(select(Team))).scalars()}
+    return [{
+        "id": m.id, "homeTeam": teams.get(m.home_id), "awayTeam": teams.get(m.away_id), 
+        "league": m.league, "kickoff": m.kickoff.isoformat() if m.kickoff else None
+    } for m in rows]
 
-if __name__ == "__main__":
-    main()
+@app.get("/matches/{match_id}/analysis")
+async def analysis(match_id: int):
+    async with Session() as s:
+        m = await s.get(Match, match_id)
+        if not m: raise HTTPException(404, "match not found")
+        
+        hs = await s.get(TeamStats, (m.home_id, m.league))
+        as_ = await s.get(TeamStats, (m.away_id, m.league))
+        elo_h = await s.get(TeamElo, m.home_id)
+        elo_a = await s.get(TeamElo, m.away_id)
+
+        all_stats = (await s.execute(select(TeamStats).where(TeamStats.league == m.league))).scalars().all()
+        total_m = sum(t.matches_played for t in all_stats) or 1
+        avg_gf = sum(t.goals_for for t in all_stats) / total_m
+        league_avg = {"home": avg_gf * 0.55, "away": avg_gf * 0.45}
+
+    if not hs or not as_ or hs.matches_played == 0:
+        raise HTTPException(400, "not enough data")
+
+    pred = predict(hs, as_, league_avg, elo_h.elo if elo_h else None, elo_a.elo if elo_a else None)
+    return {"match_id": match_id, "prediction": pred}
