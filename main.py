@@ -74,20 +74,9 @@ async def rebuild():
 
 @app.get("/matches/today")
 async def today_matches():
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    # ТЕПЕРЬ МЫ БЕРЕМ ВСЕ МАТЧИ ИЗ БАЗЫ, БЕЗ ФИЛЬТРА ПО ДАТЕ
     async with Session() as s:
-        start_date = now - timedelta(days=1)
-        end_date = now + timedelta(days=3)
-        
-        rows = (await s.execute(
-            select(Match)
-            .where(Match.kickoff >= start_date, Match.kickoff <= end_date)
-            .order_by(Match.kickoff)
-        )).scalars().all()
-        
-        if not rows:
-            rows = (await s.execute(select(Match).limit(15))).scalars().all()
-            
+        rows = (await s.execute(select(Match).order_by(Match.kickoff))).scalars().all()
         teams = {t.id: t.name for t in (await s.execute(select(Team))).scalars()}
         
     return [{
