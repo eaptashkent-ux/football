@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+httpx
+sqlalchemy
+aiosqlite
+python-dotenv
+rapidfuzz
+unidecode
+greenlet
